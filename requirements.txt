@@ -1,0 +1,8 @@
+# Telegram bot
+python-dotenv>=1.0,<2
+Telethon>=1.36,<2
+python-telegram-bot>=21,<23
+
+# Mini App web server
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
